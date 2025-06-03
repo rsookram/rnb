@@ -1,0 +1,9 @@
+[package]
+name = "rnb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+quick-xml = "0.37.5"
+rayon = "1.10.0"
+zip = { version = "4.0.0", default-features = false, features = ["deflate-flate2", "deflate-flate2-zlib-rs"] }
