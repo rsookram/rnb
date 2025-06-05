@@ -1,41 +1,30 @@
 use std::{char::decode_utf16, env::args_os, fs};
 
-// Assuming that there are < 30k paragraphs per book
-// First, metadata on paragraphs:
-// - u16 of number of paragraphs in the book
-//
-// Then paragraphs... Paragraph format is:
-// - length prefix (u16 for bytes of paragraph text)
-//   - the highest three bits are flags; from highest to lowest:
-//   - isImage: interpret the remaining bits as an image index
-//   - isBold: display the paragraph with bold text
-//   - isLarge: display the paragraph with larger text
-//
-// - text of paragraph (UTF-16LE)
-// - list of spans
-//   - num furigana spans (u8)
-//   - each span has 4 fields
-//   - the start offset of where it applies to the paragraph (u16)
-//   - the number of chars it applies to in the paragraph (u8)
-//   - number of bytes for the reading (u8)
-//   - UTF-16LE encoded bytes for reading
-//
-// After paragraphs come the images, one image after the next.
-// Then the image metadata:
-// For each image, start offset within entire file (u32), then size of image in bytes
-// (u32)
-// Finally the number of images (u8)
 fn main() {
     let path = args_os().nth(1).unwrap();
 
     let bytes = fs::read(path).unwrap();
     let mut bytes = bytes.as_slice();
 
-    let num_paragraphs = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let num_blocks = u16::from_le_bytes([bytes[0], bytes[1]]);
     bytes = &bytes[2..];
-    println!("{num_paragraphs}");
+    println!("num blocks {num_blocks}");
 
-    for i in 0..num_paragraphs {
+    let num_images = bytes[0];
+    bytes = &bytes[1..];
+    println!("num images {num_images}");
+
+    for i in 0..num_images {
+        let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        bytes = &bytes[4..];
+
+        let uncompressed_length = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        bytes = &bytes[4..];
+
+        println!("image meta {i}: offset={offset}, uncompressed_length={uncompressed_length}");
+    }
+
+    for i in 0..num_blocks {
         let prefix = u16::from_le_bytes([bytes[0], bytes[1]]);
         bytes = &bytes[2..];
 
@@ -51,7 +40,7 @@ fn main() {
         let length = prefix & !(0b111 << 13);
         if length == 0 {
             println!(
-                "zero length paragraph: idx={i}, bold={is_bold}, is_large={is_large}, prefix={prefix}",
+                "zero length block: idx={i}, bold={is_bold}, is_large={is_large}, prefix={prefix}",
             );
             continue;
         }
@@ -67,7 +56,7 @@ fn main() {
         .map(|ch| ch.unwrap())
         .collect::<String>();
 
-        println!("paragraph meta: idx={i}, bold={is_bold}, is_large={is_large}");
+        println!("text block meta: idx={i}, bold={is_bold}, is_large={is_large}");
         println!("{text}");
 
         let num_ruby = bytes[0];
@@ -80,7 +69,7 @@ fn main() {
             let start_offset = u16::from_le_bytes([bytes[0], bytes[1]]);
             bytes = &bytes[2..];
 
-            let num_chars_in_paragraph = bytes[0];
+            let num_chars_in_text = bytes[0];
             bytes = &bytes[1..];
 
             let reading_len = bytes[0];
@@ -98,7 +87,7 @@ fn main() {
             .collect::<String>();
 
             println!(
-                "ruby meta: idx={j}, start_offset={start_offset}, num_chars_in_paragraph={num_chars_in_paragraph}"
+                "ruby meta: idx={j}, start_offset={start_offset}, num_chars_in_text={num_chars_in_text}"
             );
             println!("{reading}");
         }

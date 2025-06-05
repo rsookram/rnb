@@ -70,25 +70,40 @@ impl Gaiji {
 
 #[derive(Debug, Default, PartialEq)]
 struct Paragraph {
-    // text is nil when the paragraph is an image.
-    text: Box<[u16]>,
+    /// text is empty when the paragraph is an image
+    text: Vec<u16>,
     image_idx: Option<u8>,
-    ruby: Box<[Ruby]>,
-    // flags indicate paragraph-level formatting information.
-    // Lowest bit is bold.
-    // Second-lowest bit is large text.
+    ruby: Vec<Ruby>,
+    /// flags indicate paragraph-level formatting information.
+    /// Lowest bit is bold.
+    /// Second-lowest bit is large text.
     flags: u8,
+}
+
+#[derive(Debug)]
+enum ContentBlock {
+    Text {
+        text: Box<[u16]>,
+        ruby: Box<[Ruby]>,
+        /// flags indicate paragraph-level formatting information.
+        /// Lowest bit is bold.
+        /// Second-lowest bit is large text.
+        flags: u8,
+    },
+    Image {
+        index: u8,
+    },
 }
 
 #[derive(Debug, PartialEq)]
 struct Ruby {
-    // startOffset is the offset into the text of the paragraph where this
-    // `reading` starts.
+    /// startOffset is the offset into the text of the paragraph where this
+    /// `reading` starts.
     start_offset: u16,
-    // length is the number of characters in the paragraph that this reading is
-    // associated with.
+    /// length is the number of characters in the paragraph that this reading is
+    /// associated with.
     length: u8,
-    // reading is the furigana associated with some text within a paragraph.
+    /// reading is the furigana associated with some text within a paragraph.
     reading: Box<[u16]>,
 }
 
@@ -103,13 +118,14 @@ fn main() {
     let gaiji = get_gaiji(&mut z);
 
     let paragraphs = parse_paragraphs(&input_path, text_files, &image_files, gaiji);
+    let blocks = merge_paragraphs(paragraphs);
 
     let output_path = input_path.with_extension("rnb");
     println!("write to {}", output_path.display());
 
     let out = File::create(&output_path).unwrap();
 
-    write_file(input_path, out, paragraphs, image_files);
+    write_file(input_path, out, blocks, image_files);
 }
 
 fn get_text_files(z: &mut Archive) -> TextFiles {
@@ -301,7 +317,7 @@ fn parse_paragraphs(
     text_files: TextFiles,
     image_files: &ImageFiles,
     gaiji: Gaiji,
-) -> Box<[Paragraph]> {
+) -> Vec<Paragraph> {
     let input = text_files
         .file_numbers
         .into_iter()
@@ -457,16 +473,16 @@ fn parse_text_file(content: &str, image_files: &ImageFiles, gaiji: &Gaiji) -> Ve
                     match paragraph {
                         ParagraphParseState::Content { flags, data, ruby } => {
                             paragraphs.push(Paragraph {
-                                text: data.into_boxed_slice(),
+                                text: data,
                                 image_idx: None,
-                                ruby: ruby.into_boxed_slice(),
+                                ruby,
                                 flags,
                             });
                         }
                         ParagraphParseState::Image { image_idx } => paragraphs.push(Paragraph {
-                            text: Box::new([]),
+                            text: Vec::new(),
                             image_idx: Some(image_idx),
-                            ruby: Box::new([]),
+                            ruby: Vec::new(),
                             flags: 0,
                         }),
                         _ => {}
@@ -491,16 +507,16 @@ fn parse_text_file(content: &str, image_files: &ImageFiles, gaiji: &Gaiji) -> Ve
     match paragraph {
         ParagraphParseState::Content { flags, data, ruby } => {
             paragraphs.push(Paragraph {
-                text: data.into_boxed_slice(),
+                text: data,
                 image_idx: None,
-                ruby: ruby.into_boxed_slice(),
+                ruby,
                 flags,
             });
         }
         ParagraphParseState::Image { image_idx } => paragraphs.push(Paragraph {
-            text: Box::new([]),
+            text: Vec::new(),
             image_idx: Some(image_idx),
-            ruby: Box::new([]),
+            ruby: Vec::new(),
             flags: 0,
         }),
         _ => {}
@@ -575,84 +591,171 @@ fn get_flags(class: &[u8]) -> u8 {
     flags
 }
 
-// Assuming that there are < 30k paragraphs per book
-// First, metadata on paragraphs:
-// - u16 of number of paragraphs in the book
+fn merge_paragraphs(paragraphs: Vec<Paragraph>) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(128);
+
+    let mut last_paragraph: Option<Paragraph> = None;
+    for paragraph in paragraphs {
+        if let Some(index) = paragraph.image_idx {
+            if let Some(previous) = last_paragraph.take() {
+                blocks.push(ContentBlock::Text {
+                    text: previous.text.into_boxed_slice(),
+                    ruby: previous.ruby.into_boxed_slice(),
+                    flags: previous.flags,
+                });
+            }
+
+            blocks.push(ContentBlock::Image { index });
+            continue;
+        }
+
+        // If two adjacent paragraphs have the same formatting, merging them is possible. But these
+        // paragraphs are so rare that it's simpler to leave them unmerged.
+        if paragraph.flags != 0 {
+            if let Some(previous) = last_paragraph.take() {
+                blocks.push(ContentBlock::Text {
+                    text: previous.text.into_boxed_slice(),
+                    ruby: previous.ruby.into_boxed_slice(),
+                    flags: previous.flags,
+                });
+            }
+
+            blocks.push(ContentBlock::Text {
+                text: paragraph.text.into_boxed_slice(),
+                ruby: paragraph.ruby.into_boxed_slice(),
+                flags: paragraph.flags,
+            });
+            continue;
+        }
+
+        let Some(mut previous) = last_paragraph else {
+            last_paragraph = Some(paragraph);
+            continue;
+        };
+
+        // Check if merging would result in a block that's too long.
+        // The file format can support longer runs of text, but it's preferable to have text that
+        // isn't too long so that all the text in a block can be measured and laid out at once.
+        if previous.text.len() + paragraph.text.len() > 127
+            || previous.ruby.len() + paragraph.ruby.len() > 127
+        {
+            blocks.push(ContentBlock::Text {
+                text: previous.text.into_boxed_slice(),
+                ruby: previous.ruby.into_boxed_slice(),
+                flags: previous.flags,
+            });
+
+            last_paragraph = Some(paragraph);
+            continue;
+        }
+
+        previous.text.extend("\n".encode_utf16());
+
+        let new_start_offset: u16 = previous.text.len().try_into().unwrap();
+        previous.text.extend(paragraph.text);
+
+        previous
+            .ruby
+            .extend(paragraph.ruby.into_iter().map(|mut r| {
+                r.start_offset += new_start_offset;
+                r
+            }));
+
+        last_paragraph = Some(previous);
+    }
+
+    if let Some(paragraph) = last_paragraph {
+        blocks.push(ContentBlock::Text {
+            text: paragraph.text.into_boxed_slice(),
+            ruby: paragraph.ruby.into_boxed_slice(),
+            flags: paragraph.flags,
+        });
+    }
+
+    blocks
+}
+
+// Assuming that there are < 30k blocks per book
+// First, metadata on blocks:
+// - u16 of number of blocks in the book
 //
 // Then the image metadata:
 // - The number of images (u8)
 // - For each image, start offset within entire file (u32), then size of image in bytes
 //   (u32)
 //
-// Then paragraphs... Paragraph format is:
-// - length prefix (u16 for bytes of paragraph text)
+// Then blocks... Block format is:
+// - length prefix (u16 for bytes of block text)
 //   - the highest three bits are flags; from highest to lowest:
 //   - isImage: interpret the remaining bits as an image index
 //   - isBold: display the paragraph with bold text
 //   - isLarge: display the paragraph with larger text
 //
-// - text of paragraph (UTF-16LE)
+// - text of block (UTF-16LE)
 // - list of spans
 //   - num furigana spans (u8)
 //   - each span has 4 fields
-//   - the start offset of where it applies to the paragraph (u16)
-//   - the number of chars it applies to in the paragraph (u8)
+//   - the start offset of where it applies to the text (u16)
+//   - the number of chars it applies to in the text (u8)
 //   - number of bytes for the reading (u8)
 //   - UTF-16LE encoded bytes for reading
 //
-// After paragraphs come the images, one image after the next.
+// After blocks come the image data, one image after the next.
 fn write_file(
     input_path: PathBuf,
     mut out: File,
-    paragraphs: Box<[Paragraph]>,
+    blocks: Vec<ContentBlock>,
     image_files: ImageFiles,
 ) {
     let mut buf = Vec::with_capacity(1 << 18);
 
-    let num_paragraphs: u16 = paragraphs.len().try_into().unwrap();
-    buf.extend_from_slice(&num_paragraphs.to_le_bytes());
+    let num_blocks: u16 = blocks.len().try_into().unwrap();
+    buf.extend_from_slice(&num_blocks.to_le_bytes());
 
     let image_offsets = image_offsets(&image_files);
     extend_with_image_meta(&mut buf, &image_offsets, &image_files.uncompressed_lengths);
 
-    for paragraph in paragraphs {
-        if let Some(image_idx) = paragraph.image_idx {
-            let image_idx_or_len_prefix: u16 = u16::from(image_idx) | (1 << 15);
-            buf.extend_from_slice(&image_idx_or_len_prefix.to_le_bytes());
-            continue;
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text, ruby, flags } => {
+                let num_text_bytes: u16 = (text.len() * 2).try_into().unwrap();
+                if num_text_bytes >= 1 << 13 {
+                    panic!(
+                        "block text is too long to encode: `{}`",
+                        decode_utf16(text)
+                            .map(|res| res.unwrap())
+                            .collect::<String>(),
+                    );
+                }
+
+                let mut len_prefix = num_text_bytes;
+
+                // Use the second-highest and third-highest bits for formatting info. 10
+                // bits is probably sufficient for block length (in bytes). Proposal
+                // is to use two additional bits, leaving 13 bits for the length. 2^13 =
+                // 8192 or 4096 chars.
+                if flags >= 1 << 2 {
+                    // These flags would conflict with the flag for image indices.
+                    panic!("invalid paragraph flags: {}", flags);
+                }
+
+                len_prefix |= u16::from(flags) << 13;
+
+                buf.extend_from_slice(&len_prefix.to_le_bytes());
+                if num_text_bytes == 0 {
+                    continue;
+                }
+
+                buf.extend(text.iter().flat_map(|ch| ch.to_le_bytes()));
+
+                extend_with_ruby(&mut buf, &ruby);
+            }
+            ContentBlock::Image { index } => {
+                let image_idx_or_len_prefix: u16 = u16::from(index) | (1 << 15);
+                buf.extend_from_slice(&image_idx_or_len_prefix.to_le_bytes());
+                continue;
+            }
         }
-
-        let num_paragraph_bytes: u16 = (paragraph.text.len() * 2).try_into().unwrap();
-        if num_paragraph_bytes >= 1 << 13 {
-            panic!(
-                "paragraph is too long to encode: `{}`",
-                decode_utf16(paragraph.text)
-                    .map(|res| res.unwrap())
-                    .collect::<String>(),
-            );
-        }
-
-        let mut len_prefix = num_paragraph_bytes;
-
-        // Use the second-highest and third-highest bits for formatting info. 10
-        // bits is probably sufficient for paragraph length (in bytes). Proposal
-        // is to use two additional bits, leaving 13 bits for the length. 2^13 =
-        // 8192 or 4096 chars.
-        if paragraph.flags >= 1 << 2 {
-            // These flags would conflict with the flag for image indices.
-            panic!("invalid paragraph flags: {}", paragraph.flags);
-        }
-
-        len_prefix |= u16::from(paragraph.flags) << 13;
-
-        buf.extend_from_slice(&len_prefix.to_le_bytes());
-        if num_paragraph_bytes == 0 {
-            continue;
-        }
-
-        buf.extend(paragraph.text.iter().flat_map(|ch| ch.to_le_bytes()));
-
-        extend_with_ruby(&mut buf, &paragraph.ruby);
     }
 
     out.write_all(&buf).unwrap();
@@ -756,7 +859,7 @@ mod tests {
 
         let expected = Paragraph {
             text: "開発".encode_utf16().collect(),
-            ruby: Box::new([Ruby {
+            ruby: Vec::from([Ruby {
                 start_offset: 0,
                 length: 2,
                 reading: "かいはつ".encode_utf16().collect(),
@@ -776,7 +879,7 @@ mod tests {
 
         let expected = Paragraph {
             text: "開発".encode_utf16().collect(),
-            ruby: Box::new([Ruby {
+            ruby: Vec::from([Ruby {
                 start_offset: 0,
                 length: 2,
                 reading: "かいはつ".encode_utf16().collect(),
@@ -796,7 +899,7 @@ mod tests {
 
         let expected = Paragraph {
             text: "開発".encode_utf16().collect(),
-            ruby: Box::new([
+            ruby: Vec::from([
                 Ruby {
                     start_offset: 0,
                     length: 1,
@@ -811,5 +914,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(paragraphs[0], expected);
+    }
+
+    #[test]
+    fn merge_single() {
+        let paragraph = Paragraph {
+            text: "a".encode_utf16().collect(),
+            ..Default::default()
+        };
+
+        let mut result = merge_paragraphs(vec![paragraph]);
+
+        assert_eq!(result.len(), 1);
+
+        let ContentBlock::Text { text, .. } = result.pop().unwrap() else {
+            panic!("image");
+        };
+
+        assert_eq!(text, "a".encode_utf16().collect());
+    }
+
+    #[test]
+    fn merge_two() {
+        let paragraph_a = Paragraph {
+            text: "a".encode_utf16().collect(),
+            ..Default::default()
+        };
+        let paragraph_b = Paragraph {
+            text: "b".encode_utf16().collect(),
+            ..Default::default()
+        };
+
+        let mut result = merge_paragraphs(vec![paragraph_a, paragraph_b]);
+
+        assert_eq!(result.len(), 1);
+
+        let ContentBlock::Text { text, .. } = result.pop().unwrap() else {
+            panic!("image");
+        };
+
+        assert_eq!(text, "a\nb".encode_utf16().collect());
     }
 }
